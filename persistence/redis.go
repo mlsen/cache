@@ -3,201 +3,128 @@ package persistence
 import (
 	"time"
 
-	"github.com/gin-contrib/cache/utils"
-	"github.com/gomodule/redigo/redis"
+	"github.com/go-redis/redis/v7"
 )
 
-// RedisStore represents the cache with redis persistence
+// RedisStore represents the cache with redis cluster persistence
 type RedisStore struct {
-	pool              *redis.Pool
+	client            redis.UniversalClient
 	defaultExpiration time.Duration
 }
 
+// ClientOptions proxies Options from the go-redis library
+type ClientOptions redis.UniversalOptions
+
 // NewRedisCache returns a RedisStore
-// until redigo supports sharding/clustering, only one host will be in hostList
-func NewRedisCache(host string, password string, defaultExpiration time.Duration) *RedisStore {
-	var pool = &redis.Pool{
-		MaxIdle:     5,
-		IdleTimeout: 240 * time.Second,
-		Dial: func() (redis.Conn, error) {
-			// the redis protocol should probably be made sett-able
-			c, err := redis.Dial("tcp", host)
-			if err != nil {
-				return nil, err
-			}
-			if len(password) > 0 {
-				if _, err := c.Do("AUTH", password); err != nil {
-					c.Close()
-					return nil, err
-				}
-			} else {
-				// check with PING
-				if _, err := c.Do("PING"); err != nil {
-					c.Close()
-					return nil, err
-				}
-			}
-			return c, err
-		},
-		// custom connection test method
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			if _, err := c.Do("PING"); err != nil {
-				return err
-			}
-			return nil
-		},
+func NewRedisCache(opts *ClientOptions, defaultExpiration time.Duration) (*RedisStore, error) {
+	uniopts := redis.UniversalOptions(*opts)
+	c := redis.NewUniversalClient(&uniopts)
+
+	err := c.Ping().Err()
+	if err != nil {
+		return nil, err
 	}
-	return &RedisStore{pool, defaultExpiration}
+	return &RedisStore{c, defaultExpiration}, nil
 }
 
-// NewRedisCacheWithPool returns a RedisStore using the provided pool
-// until redigo supports sharding/clustering, only one host will be in hostList
-func NewRedisCacheWithPool(pool *redis.Pool, defaultExpiration time.Duration) *RedisStore {
-	return &RedisStore{pool, defaultExpiration}
+// NewRedisCacheFromClient returns a RedisStore from an existing go-redis client
+func NewRedisCacheFromClient(client redis.UniversalClient, defaultExpiration time.Duration) *RedisStore {
+	return &RedisStore{client, defaultExpiration}
 }
 
 // Set (see CacheStore interface)
 func (c *RedisStore) Set(key string, value interface{}, expires time.Duration) error {
-	conn := c.pool.Get()
-	defer conn.Close()
-	return c.invoke(conn.Do, key, value, expires)
+	return c.client.Set(key, value, c.expval(expires)).Err()
 }
 
 // Add (see CacheStore interface)
 func (c *RedisStore) Add(key string, value interface{}, expires time.Duration) error {
-	conn := c.pool.Get()
-	defer conn.Close()
-	if exists(conn, key) {
+	stored, err := c.client.SetNX(key, value, c.expval(expires)).Result()
+	if err != nil {
+		return err
+	}
+	if !stored {
 		return ErrNotStored
 	}
-	return c.invoke(conn.Do, key, value, expires)
+	return nil
 }
 
 // Replace (see CacheStore interface)
 func (c *RedisStore) Replace(key string, value interface{}, expires time.Duration) error {
-	conn := c.pool.Get()
-	defer conn.Close()
-	if !exists(conn, key) {
+	if c.client.Exists(key).Val() == 0 {
 		return ErrNotStored
 	}
-	err := c.invoke(conn.Do, key, value, expires)
 	if value == nil {
 		return ErrNotStored
 	}
-
-	return err
-
+	return c.Set(key, value, c.expval(expires))
 }
 
 // Get (see CacheStore interface)
 func (c *RedisStore) Get(key string, ptrValue interface{}) error {
-	conn := c.pool.Get()
-	defer conn.Close()
-	raw, err := conn.Do("GET", key)
-	if raw == nil {
+	err := c.client.Get(key).Scan(ptrValue)
+	if err == redis.Nil {
 		return ErrCacheMiss
 	}
-	item, err := redis.Bytes(raw, err)
-	if err != nil {
-		return err
-	}
-	return utils.Deserialize(item, ptrValue)
-}
-
-func exists(conn redis.Conn, key string) bool {
-	retval, _ := redis.Bool(conn.Do("EXISTS", key))
-	return retval
+	return err
 }
 
 // Delete (see CacheStore interface)
 func (c *RedisStore) Delete(key string) error {
-	conn := c.pool.Get()
-	defer conn.Close()
-	if !exists(conn, key) {
+	del, err := c.client.Del(key).Result()
+	if err != nil {
+		return err
+	}
+	if del == 0 {
 		return ErrCacheMiss
 	}
-	_, err := conn.Do("DEL", key)
-	return err
+	return nil
 }
 
 // Increment (see CacheStore interface)
 func (c *RedisStore) Increment(key string, delta uint64) (uint64, error) {
-	conn := c.pool.Get()
-	defer conn.Close()
-	// Check for existance *before* increment as per the cache contract.
-	// redis will auto create the key, and we don't want that. Since we need to do increment
-	// ourselves instead of natively via INCRBY (redis doesn't support wrapping), we get the value
-	// and do the exists check this way to minimize calls to Redis
-	val, err := conn.Do("GET", key)
-	if val == nil {
-		return 0, ErrCacheMiss
-	}
-	if err == nil {
-		currentVal, err := redis.Int64(val, nil)
-		if err != nil {
-			return 0, err
+	val, err := c.client.Get(key).Int64()
+	if err != nil {
+		if err == redis.Nil {
+			return 0, ErrCacheMiss
 		}
-		sum := currentVal + int64(delta)
-		_, err = conn.Do("SET", key, sum)
-		if err != nil {
-			return 0, err
-		}
-		return uint64(sum), nil
+		return 0, err
 	}
-
-	return 0, err
+	sum := val + int64(delta)
+	err = c.client.Set(key, sum, 0).Err()
+	if err != nil {
+		return 0, err
+	}
+	return uint64(sum), nil
 }
 
 // Decrement (see CacheStore interface)
-func (c *RedisStore) Decrement(key string, delta uint64) (newValue uint64, err error) {
-	conn := c.pool.Get()
-	defer conn.Close()
-	// Check for existance *before* increment as per the cache contract.
-	// redis will auto create the key, and we don't want that, hence the exists call
-	if !exists(conn, key) {
-		return 0, ErrCacheMiss
+func (c *RedisStore) Decrement(key string, delta uint64) (uint64, error) {
+	val, err := c.client.Get(key).Int64()
+	if err != nil {
+		if err == redis.Nil {
+			return 0, ErrCacheMiss
+		}
+		return 0, err
 	}
-	// Decrement contract says you can only go to 0
-	// so we go fetch the value and if the delta is greater than the amount,
-	// 0 out the value
-	currentVal, err := redis.Int64(conn.Do("GET", key))
-	if err == nil && delta > uint64(currentVal) {
-		tempint, err := redis.Int64(conn.Do("DECRBY", key, currentVal))
-		return uint64(tempint), err
+	if delta > uint64(val) {
+		delta = uint64(val)
 	}
-	tempint, err := redis.Int64(conn.Do("DECRBY", key, delta))
+	tempint, err := c.client.DecrBy(key, int64(delta)).Result()
 	return uint64(tempint), err
 }
 
 // Flush (see CacheStore interface)
 func (c *RedisStore) Flush() error {
-	conn := c.pool.Get()
-	defer conn.Close()
-	_, err := conn.Do("FLUSHALL")
-	return err
+	return c.client.FlushAll().Err()
 }
 
-func (c *RedisStore) invoke(f func(string, ...interface{}) (interface{}, error),
-	key string, value interface{}, expires time.Duration) error {
-
+func (c *RedisStore) expval(expires time.Duration) time.Duration {
 	switch expires {
 	case DEFAULT:
-		expires = c.defaultExpiration
+		return c.defaultExpiration
 	case FOREVER:
-		expires = time.Duration(0)
+		return time.Duration(0)
 	}
-
-	b, err := utils.Serialize(value)
-	if err != nil {
-		return err
-	}
-
-	if expires > 0 {
-		_, err := f("SETEX", key, int32(expires/time.Second), b)
-		return err
-	}
-
-	_, err = f("SET", key, b)
-	return err
-
+	return expires
 }

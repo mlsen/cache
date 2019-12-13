@@ -14,7 +14,10 @@ var newRedisStore = func(t *testing.T, defaultExpiration time.Duration) CacheSto
 	if err == nil {
 		c.Write([]byte("flush_all\r\n"))
 		c.Close()
-		redisCache := NewRedisCache(redisTestServer, "", defaultExpiration)
+		redisCache, _ := NewRedisCache(&ClientOptions{
+			Addrs: []string{"localhost:6379"},
+		}, defaultExpiration)
+
 		redisCache.Flush()
 		return redisCache
 	}
