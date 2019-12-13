@@ -3,6 +3,7 @@ package persistence
 import (
 	"time"
 
+	"github.com/gin-contrib/cache/utils"
 	"github.com/go-redis/redis/v7"
 )
 
@@ -34,11 +35,19 @@ func NewRedisCacheFromClient(client redis.UniversalClient, defaultExpiration tim
 
 // Set (see CacheStore interface)
 func (c *RedisStore) Set(key string, value interface{}, expires time.Duration) error {
+	value, err := utils.Serialize(value)
+	if err != nil {
+		return err
+	}
 	return c.client.Set(key, value, c.expval(expires)).Err()
 }
 
 // Add (see CacheStore interface)
 func (c *RedisStore) Add(key string, value interface{}, expires time.Duration) error {
+	value, err := utils.Serialize(value)
+	if err != nil {
+		return err
+	}
 	stored, err := c.client.SetNX(key, value, c.expval(expires)).Result()
 	if err != nil {
 		return err
@@ -51,6 +60,10 @@ func (c *RedisStore) Add(key string, value interface{}, expires time.Duration) e
 
 // Replace (see CacheStore interface)
 func (c *RedisStore) Replace(key string, value interface{}, expires time.Duration) error {
+	value, err := utils.Serialize(value)
+	if err != nil {
+		return err
+	}
 	if c.client.Exists(key).Val() == 0 {
 		return ErrNotStored
 	}
@@ -62,11 +75,14 @@ func (c *RedisStore) Replace(key string, value interface{}, expires time.Duratio
 
 // Get (see CacheStore interface)
 func (c *RedisStore) Get(key string, ptrValue interface{}) error {
-	err := c.client.Get(key).Scan(ptrValue)
-	if err == redis.Nil {
-		return ErrCacheMiss
+	val, err := c.client.Get(key).Bytes()
+	if err != nil {
+		if err == redis.Nil {
+			return ErrCacheMiss
+		}
+		return err
 	}
-	return err
+	return utils.Deserialize(val, ptrValue)
 }
 
 // Delete (see CacheStore interface)
