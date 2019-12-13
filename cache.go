@@ -99,11 +99,9 @@ func (w *cachedWriter) Write(data []byte) (int, error) {
 				w.Header(),
 				data,
 			}
-			fmt.Println("INSIDE:", w.key, val, w.expire)
 			err = store.Set(w.key, val, w.expire)
 			if err != nil {
 				// need logger
-				fmt.Println("HADHADHADHADH")
 			}
 		}
 	}
@@ -162,7 +160,6 @@ func CachePage(store persistence.CacheStore, expire time.Duration, handle gin.Ha
 			if err != persistence.ErrCacheMiss {
 				log.Println(err.Error())
 			}
-			fmt.Println("key not found")
 			// replace writer
 			writer := newCachedWriter(store, expire, c.Writer, key)
 			c.Writer = writer
@@ -173,7 +170,6 @@ func CachePage(store persistence.CacheStore, expire time.Duration, handle gin.Ha
 				store.Delete(key)
 			}
 		} else {
-			fmt.Println("cache hit!")
 			c.Writer.WriteHeader(cache.Status)
 			for k, vals := range cache.Header {
 				for _, v := range vals {
